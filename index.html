@@ -2667,12 +2667,86 @@ document.getElementById('num').addEventListener('keydown',e=>{if(e.key==='Enter'
 // ── 直接抓取网站，无需本地爬虫服务 ──
 const KJ_URL='https://axavdfvfb.poodco.com:22447/kj/his/am.html';
 
+// 数据转发服务API（部署版使用）
+// ⚠️ 部署后需要替换为实际的服务器地址
+const PROXY_API_BASE='https://kj-proxy-server.onrender.com';
+
+// CORS代理列表（用于部署版）
+const CORS_PROXIES=[
+  'https://api.allorigins.win/raw?url=',
+  'https://corsproxy.io/?',
+  'https://api.codetabs.com/v1/proxy?quest=',
+  'https://thingproxy.freeboard.io/fetch/'
+];
+
 async function fetchFromSite(){
-  // 用 no-cors 模式可以发请求但拿不到内容；需要用CORS代理或直接请求
-  // 先尝试直接 fetch（如果网站允许跨域）
-  const res=await fetch(KJ_URL,{signal:AbortSignal.timeout(20000)});
-  const html=await res.text();
-  return parseKJHtml(html);
+  // 1. 先尝试本站 /api/latest（Vercel Serverless Function，无CORS问题）
+  try{
+    const res=await fetch('/api/latest',{signal:AbortSignal.timeout(12000)});
+    if(res.ok){
+      const d=await res.json();
+      if(d.success)return d;
+    }
+  }catch(e){}
+
+  // 2. 直接 fetch（本地运行时可能成功）
+  try{
+    const res=await fetch(KJ_URL,{signal:AbortSignal.timeout(10000)});
+    const html=await res.text();
+    return parseKJHtml(html);
+  }catch(e){
+    // 直接失败，尝试代理服务
+    return await fetchViaProxyService();
+  }
+}
+
+// 使用数据转发服务获取数据（部署版主要方式）
+async function fetchViaProxyService(){
+  try{
+    const res=await fetch(PROXY_API_BASE+'/api/latest',{signal:AbortSignal.timeout(15000)});
+    const data=await res.json();
+    if(data.success&&data.data){
+      const r=data.data;
+      return{
+        success:true,
+        period:r.period,
+        date:r.date,
+        dateShort:r.dateShort,
+        specialNum:r.specialNum,
+        zodiac:r.zodiac
+      };
+    }
+    return{success:false,error:'代理服务无数据'};
+  }catch(e){
+    console.log('代理服务失败:',e.message);
+    // 代理服务失败，尝试CORS代理
+    return await fetchViaCorsProxy();
+  }
+}
+
+async function fetchViaCorsProxy(){
+  // 尝试多个CORS代理
+  for(const proxy of CORS_PROXIES){
+    try{
+      const res=await fetch(proxy+encodeURIComponent(KJ_URL),{signal:AbortSignal.timeout(10000)});
+      if(!res.ok)continue;
+      const html=await res.text();
+      if(!html||html.length<100)continue;
+      const result=parseKJHtml(html);
+      if(result.success)return result;
+    }catch(e){
+      console.log('CORS代理失败:',proxy,e.message);
+      continue;
+    }
+  }
+  return{success:false,error:'所有代理均不可用'};
+}
+
+function formatDateShort(dateStr){
+  if(!dateStr)return'';
+  const m=dateStr.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if(m)return`${parseInt(m[2])}.${parseInt(m[3])}`;
+  return dateStr;
 }
 
 function parseKJHtml(text){
@@ -2704,9 +2778,28 @@ window.addEventListener('load', ()=>setTimeout(autoFetchSilent, 800));
 
 async function autoFetchSilent(){
   try{
-    // 静默模式：直接走本地服务批量补全，不打扰用户
-    const res=await fetch('http://localhost:3000/fetch-latest?count=all',{signal:AbortSignal.timeout(20000)});
-    const data=await res.json();
+    // 静默模式：尝试从网站获取（含CORS代理降级）
+    let data=null;
+    
+    try{
+      const siteData=await fetchFromSite();
+      if(siteData.success){
+        data={success:true,records:[{
+          dateShort:siteData.dateShort,
+          specialNum:siteData.specialNum,
+          zodiac:siteData.zodiac,
+          date:siteData.date
+        }]};
+      }
+    }catch(e){
+      data=null;
+    }
+    
+    // 均失败时静默退出
+    if(!data||!data.success){
+      return;
+    }
+    
     if(data.success && data.records && data.records.length>0){
       const added=batchImport(data.records);
       const last=H[H.length-1];
@@ -2776,8 +2869,8 @@ async function autoFetch(){
   const info=document.getElementById('nextInfo');
   
   try{
-    // 先尝试直连网站（all = 尽量多抓）
-    let data;
+    // 先尝试从网站直连或CORS代理获取
+    let data=null;
     try{
       data=await fetchFromSite();
     }catch(e){
@@ -2787,14 +2880,29 @@ async function autoFetch(){
     btn.textContent=origText;
     btn.disabled=false;
 
-    // 直连失败，降级走本地服务（count=all）
-    if(!data||!data.success){
-      info.textContent='⏳ 正在通过本地服务批量获取...';
-      await autoFetchViaServer();
+    if(data&&data.success){
+      // 直连/代理成功，直接入库
+      const records=[{
+        dateShort:data.dateShort,
+        specialNum:data.specialNum,
+        zodiac:data.zodiac,
+        date:data.date
+      }];
+      const added=batchImport(records);
+      const last=H[H.length-1];
+      const ly=last[3]||2026;
+      if(added===0){
+        info.innerHTML=`✅ 已是最新 <b style="color:#ffd700">${fmtDate(last[0],ly)}</b> 特码<b style="color:#ffd700">${pad(last[1])}${last[2]}</b>`;
+      }else{
+        info.innerHTML=`🌐 新增 <b style="color:#4ecdc4">${added}</b> 期，最新: <b style="color:#4ecdc4">${fmtDate(last[0],ly)}</b> 特码<b style="color:#4ecdc4">${pad(last[1])}${last[2]}</b>`;
+        updateInfo();
+        document.getElementById('num').value=last[1];
+        setTimeout(()=>go(), 300);
+      }
       return;
     }
 
-    // 直连只能拿到1条（fetchFromSite限制），降级走本地服务补全更多
+    // 直连失败，降级走本地服务（仅本地运行时有效）
     info.textContent='⏳ 正在通过本地服务批量获取...';
     await autoFetchViaServer();
 
@@ -2810,6 +2918,8 @@ async function autoFetch(){
 async function autoFetchViaServer(){
   const btn=document.querySelector('button.auto');
   const info=document.getElementById('nextInfo');
+  
+  // 尝试本地服务（仅适用于本地运行）
   try{
     const res=await fetch('http://localhost:3000/fetch-latest?count=all',{signal:AbortSignal.timeout(30000)});
     const data=await res.json();
@@ -2823,7 +2933,6 @@ async function autoFetchViaServer(){
       }else{
         info.innerHTML=`🌐 新增 <b style="color:#4ecdc4">${added}</b> 期记录，最新: <b style="color:#4ecdc4">${fmtDate(last[0],ly)}</b> 特码<b style="color:#4ecdc4">${pad(last[1])}${last[2]}</b>`;
         updateInfo();
-        // 自动触发一次预测
         document.getElementById('num').value=last[1];
         setTimeout(()=>go(), 300);
       }
@@ -2831,7 +2940,7 @@ async function autoFetchViaServer(){
       info.textContent='❌ 获取失败: '+(data.error||'未知错误');
     }
   }catch(e2){
-    info.textContent='❌ 无法获取数据，请手动输入号码（或重启电脑后再试）';
+    info.textContent='❌ 无法获取数据，请手动输入号码（或检查网络连接）';
   }
 }
 
